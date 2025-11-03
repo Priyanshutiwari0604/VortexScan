@@ -4,6 +4,11 @@ VORTEXSCAN - dirsearch-like directory & file discovery tool
 Author: Tester (example)
 Save as: vortexscan.py
 
+Hybrid Output Mode:
+ - Clean Professional Mode (default): Lightweight, dependency-free, color-coded
+ - Advanced UI Mode: Auto-enabled if 'rich' is installed - tables, progress bars, live display
+ - Machine-friendly export: CSV/JSON formats for automation
+
 Goals:
  - Behave very similarly to dirsearch / gobuster for common usage patterns.
  - CLI flags: -u/--url, -w/--wordlist, -e/--extensions, -t/--threads, -T/--timeout,
@@ -13,8 +18,6 @@ Goals:
  - Scheme probing: if user passes host without scheme, tool probes https then http.
  - Resume support writes/reads output file.
  - ThreadPoolExecutor for concurrency; requests.Session pooling.
- - Friendly banner and legal reminder.
- - Color output if colorama installed (optional).
 """
 
 from __future__ import annotations
@@ -30,30 +33,39 @@ from urllib.parse import urljoin, urlparse
 from threading import Lock
 from queue import Queue, Empty
 from typing import Optional, Set, List, Tuple, Dict
+from datetime import datetime
+
+# ----- Detect rich library for advanced UI -----
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich import box
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
 
 # ----- Config & Banner -----
 TOOL_NAME = "VORTEXSCAN"
+VERSION = "2.0"
 BANNER = r"""
- __     ___  ____  _____  ________  ______   ___   _   __
- \ \   / / |/ /\ \/ / _ \|  ____\ \/ /  _ \ / _ \ | | / /
-  \ \_/ /| ' /  \  / | | | |__   \  /| |_) | | | || |/ / 
-   \   / |  <   /  \ | | |  __|  /  \|  _ <| | | ||    \ 
-    | |  | . \ / /\ \ |_| | |____/ /\ \ |_) | |_| || |\  \
-    |_|  |_|\_\/  \_\___/|______/_/  \_\____/ \___/ |_| \_\
-                                                         
-                      V O R T E X  S C A N
+╦  ╦╔═╗╦═╗╔╦╗╔═╗═╗ ╦  ╔═╗╔═╗╔═╗╔╗╔
+╚╗╔╝║ ║╠╦╝ ║ ║╣ ╔╩╦╝  ╚═╗║  ╠═╣║║║
+ ╚╝ ╚═╝╩╚═ ╩ ╚═╝╩ ╚═  ╚═╝╚═╝╩ ╩╝╚╝
+    Directory & File Discovery Tool
 """
 DEFAULT_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-    "Mozilla/5.0 (X11; Linux x86_64)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
     "curl/7.85.0",
     "Wget/1.21.3 (linux-gnu)",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X)",
 ]
 PRINT_LOCK = Lock()
 
-# Optional colors (if user has colorama)
+# Optional colors (if user has colorama or fallback to ANSI)
 try:
     import colorama
     colorama.init(autoreset=True)
@@ -61,19 +73,38 @@ try:
     GREEN = colorama.Fore.GREEN
     YELLOW = colorama.Fore.YELLOW
     CYAN = colorama.Fore.CYAN
+    BLUE = colorama.Fore.BLUE
+    MAGENTA = colorama.Fore.MAGENTA
     RESET = colorama.Style.RESET_ALL
+    BRIGHT = colorama.Style.BRIGHT
+    DIM = colorama.Style.DIM
 except Exception:
-    RED = GREEN = YELLOW = CYAN = RESET = ""
+    # Fallback to ANSI codes
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    CYAN = "\033[96m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    BRIGHT = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
 
 # ----- Utilities -----
 def safe_print(msg: str):
     with PRINT_LOCK:
         print(msg)
 
-def print_banner():
-    print(BANNER)
-    print(f"[+] {TOOL_NAME} - dirsearch-like directory & file discovery")
-    print("[!] Only scan targets you own or have explicit permission to test.\n")
+def print_banner(use_rich: bool = False):
+    if use_rich and RICH_AVAILABLE:
+        console = Console()
+        console.print(BANNER, style="bold cyan")
+        console.print(f"[bold]{TOOL_NAME}[/bold] v{VERSION} - Directory & File Discovery Tool", style="cyan")
+        console.print("[yellow]⚠️  Only scan targets you own or have explicit permission to test.[/yellow]\n")
+    else:
+        print(f"{CYAN}{BRIGHT}{BANNER}{RESET}")
+        print(f"{BRIGHT}[+] {TOOL_NAME} v{VERSION} - Directory & File Discovery Tool{RESET}")
+        print(f"{YELLOW}[!] Only scan targets you own or have explicit permission to test.{RESET}\n")
 
 def normalize_target(raw: str) -> str:
     """Return raw target; if missing scheme return as-is for probing later."""
@@ -83,7 +114,6 @@ def probe_scheme(host: str, timeout: float, headers: Dict[str,str], proxy: Optio
     """If user didn't supply scheme, try https then http; return working base URL."""
     if host.startswith("http://") or host.startswith("https://"):
         return host.rstrip("/")
-    # Try https
     for scheme in ("https://", "http://"):
         try:
             url = scheme + host
@@ -91,11 +121,9 @@ def probe_scheme(host: str, timeout: float, headers: Dict[str,str], proxy: Optio
             if proxy:
                 s.proxies.update({"http": proxy, "https": proxy})
             r = s.head(url, timeout=timeout, allow_redirects=True, headers=headers)
-            # If we get any response code, we'll accept scheme (even 4xx/5xx).
             return url.rstrip("/")
         except requests.RequestException:
             continue
-    # fallback to https if both failed
     return "https://" + host
 
 def load_wordlist(path: str) -> List[str]:
@@ -104,12 +132,7 @@ def load_wordlist(path: str) -> List[str]:
     return lines
 
 def expand_targets(entries: List[str], exts: List[str]) -> List[str]:
-    """
-    Build target list (path portion). For each wordlist entry produce:
-     - entry
-     - entry.ext for each ext (not double-dot)
-    Keep order and dedupe.
-    """
+    """Build target list with extensions"""
     seen = set()
     out = []
     for e in entries:
@@ -120,7 +143,6 @@ def expand_targets(entries: List[str], exts: List[str]) -> List[str]:
         for ext in exts:
             ext = ext.lstrip(".")
             if candidate.endswith("/"):
-                # for directory-like entries, try index.ext
                 idx = candidate.rstrip("/") + f"/index.{ext}"
                 if idx not in seen:
                     seen.add(idx)
@@ -139,6 +161,15 @@ def default_headers(random_agent: bool) -> Dict[str,str]:
     if random_agent:
         return {"User-Agent": random.choice(DEFAULT_USER_AGENTS)}
     return {"User-Agent": DEFAULT_USER_AGENTS[0]}
+
+def format_size(size: int) -> str:
+    """Format bytes to human readable"""
+    if size < 1024:
+        return f"{size}B"
+    elif size < 1024 * 1024:
+        return f"{size/1024:.1f}KB"
+    else:
+        return f"{size/(1024*1024):.1f}MB"
 
 # ----- Scanner class -----
 class VortexScanner:
@@ -159,12 +190,14 @@ class VortexScanner:
         recursive: bool = False,
         max_depth: int = 2,
         resume: bool = False,
-        output_format: str = "text"
+        output_format: str = "text",
+        use_rich: bool = False
     ):
         self.base = base.rstrip("/")
         self.targets_queue = Queue()
         for t in targets:
             self.targets_queue.put((t, 0))
+        self.total_targets = len(targets)
         self.threads = max(1, threads)
         self.timeout = timeout
         self.random_agent = random_agent
@@ -179,20 +212,21 @@ class VortexScanner:
         self.max_depth = max_depth
         self.running = True
         self.output_format = output_format.lower()
-        # discovered items: (status, url, size, elapsed)
+        self.use_rich = use_rich and RICH_AVAILABLE
         self.discovered: List[Tuple[int,str,int,float]] = []
         self.recorded_set: Set[str] = set()
-        # If resuming from file, read existing entries into recorded_set
+        self.stats_by_code: Dict[int, int] = {}
+        self.processed_count = 0
+        self.start_time = time.time()
+        
         if resume and out_fp:
             try:
-                # ensure file cursor at start
                 out_fp.flush()
                 out_fp.seek(0)
                 for ln in out_fp:
                     ln = ln.strip()
                     if not ln:
                         continue
-                    # "200 https://example.com/foo (123 bytes, 0.12s)"
                     parts = ln.split()
                     if len(parts) >= 2:
                         url = parts[1]
@@ -218,35 +252,61 @@ class VortexScanner:
         return code != 404
 
     def _enqueue_recursive_children(self, parent_url: str, depth: int, original_entries: List[str]):
-        # For recursion: add original entries under the discovered path
-        # Build relative path from base
         parsed = urlparse(parent_url)
         parent_path = parsed.path.rstrip("/")
         if parent_path == "":
             parent_path = "/"
         for e in original_entries:
-            # skip absolute URLs in wordlist
             if e.startswith("http://") or e.startswith("https://"):
                 continue
             new_path = (parent_path + "/" + e.lstrip("/")).lstrip("/")
             self.targets_queue.put((new_path, depth + 1))
 
-    def worker(self, original_entries: List[str]):
+    def _format_clean_output(self, code: int, url: str, size: int, elapsed: float) -> str:
+        """Clean professional output format"""
+        status_str = f"[{code}]"
+        size_str = format_size(size)
+        time_str = f"{elapsed:.2f}s"
+        
+        # Truncate URL if too long
+        max_url_len = 70
+        display_url = url if len(url) <= max_url_len else url[:max_url_len-3] + "..."
+        
+        return f"{status_str:7} {display_url:72} {size_str:>10} {time_str:>8}"
+
+    def _get_status_color(self, code: int) -> str:
+        """Get color for status code"""
+        if 200 <= code < 300:
+            return f"{GREEN}{BRIGHT}"
+        elif 300 <= code < 400:
+            return CYAN
+        elif code == 403:
+            return f"{YELLOW}{BRIGHT}"
+        elif 400 <= code < 500:
+            return YELLOW
+        else:
+            return RED
+
+    def worker(self, original_entries: List[str], progress_callback=None):
         session = self._make_session()
         while self.running:
             try:
                 path, depth = self.targets_queue.get(timeout=1)
             except Empty:
                 return
-            # join base + path
+            
             url = urljoin(self.base + "/", path.lstrip("/"))
-            # skip if recorded
+            
             if is_url_already_recorded(url, self.recorded_set):
                 self.targets_queue.task_done()
+                self.processed_count += 1
+                if progress_callback:
+                    progress_callback()
                 continue
-            # polite delay per worker
+            
             if self.delay:
                 time.sleep(self.delay)
+            
             headers = default_headers(self.random_agent)
             start = time.time()
             try:
@@ -257,131 +317,302 @@ class VortexScanner:
                 final_url = resp.url
             except requests.RequestException as e:
                 if self.verbose:
-                    safe_print(f"{YELLOW}[!] request error for {url}: {e}{RESET}")
+                    safe_print(f"{YELLOW}[!] {url}: {e}{RESET}")
                 self.targets_queue.task_done()
+                self.processed_count += 1
+                if progress_callback:
+                    progress_callback()
                 continue
 
-            # record using final_url (so redirects map cleanly)
             if final_url in self.recorded_set:
                 self.targets_queue.task_done()
+                self.processed_count += 1
+                if progress_callback:
+                    progress_callback()
                 continue
-            # decide interesting
+            
+            self.stats_by_code[code] = self.stats_by_code.get(code, 0) + 1
+            
             if self._interesting(code):
-                line = f"{code} {final_url} ({size} bytes, {elapsed:.2f}s)"
-                # colorize by code type
-                if 200 <= code < 300:
-                    safe_print(f"{GREEN}{line}{RESET}")
-                elif 300 <= code < 400:
-                    safe_print(f"{CYAN}{line}{RESET}")
-                elif 400 <= code < 500:
-                    safe_print(f"{YELLOW}{line}{RESET}")
-                else:
-                    safe_print(f"{RED}{line}{RESET}")
-
-                # append to discovered + write to output if requested
                 self.discovered.append((code, final_url, size, elapsed))
+                
+                if not self.use_rich:
+                    # Clean professional output
+                    line = self._format_clean_output(code, final_url, size, elapsed)
+                    color = self._get_status_color(code)
+                    safe_print(f"{color}{line}{RESET}")
+                
                 try:
                     if self.out_fp:
-                        self.out_fp.write(line + "\n")
+                        self.out_fp.write(f"{code} {final_url} ({size} bytes, {elapsed:.2f}s)\n")
                         self.out_fp.flush()
                 except Exception:
                     pass
 
-                # recursion heuristic
                 if self.recursive and depth < self.max_depth:
                     ctype = resp.headers.get("Content-Type", "")
                     lastseg = urlparse(final_url).path.rstrip("/").split("/")[-1]
-                    # heuristics: html 200 and last segment has no extension -> possible directory; or url endswith '/'
                     if (code == 200 and "text/html" in ctype.lower() and "." not in lastseg) or final_url.endswith("/"):
                         self._enqueue_recursive_children(final_url, depth, original_entries)
             else:
-                if self.verbose:
-                    safe_print(f"- {code} {url} [{elapsed:.2f}s]")
+                if self.verbose and not self.use_rich:
+                    safe_print(f"{DIM}[{code}] {url} [{elapsed:.2f}s]{RESET}")
 
-            # mark visited
             self.recorded_set.add(final_url)
             self.targets_queue.task_done()
+            self.processed_count += 1
+            if progress_callback:
+                progress_callback()
 
-    def run(self, original_entries: List[str]):
+    def run_clean_mode(self, original_entries: List[str]):
+        """Clean professional mode output"""
+        # Header
+        safe_print(f"\n{BLUE}{'═'*100}{RESET}")
+        safe_print(f"{BRIGHT}{'SCAN CONFIGURATION':^100}{RESET}")
+        safe_print(f"{BLUE}{'═'*100}{RESET}")
+        safe_print(f"  {BRIGHT}Target:{RESET}      {self.base}")
+        safe_print(f"  {BRIGHT}Wordlist:{RESET}    {len(original_entries)} entries → {self.total_targets} targets (with extensions)")
+        safe_print(f"  {BRIGHT}Threads:{RESET}     {self.threads}")
+        safe_print(f"  {BRIGHT}Timeout:{RESET}     {self.timeout}s")
+        if self.status_filter:
+            safe_print(f"  {BRIGHT}Filter:{RESET}      Status codes: {','.join(map(str, sorted(self.status_filter)))}")
+        else:
+            safe_print(f"  {BRIGHT}Filter:{RESET}      All except 404")
+        safe_print(f"  {BRIGHT}Started:{RESET}     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        safe_print(f"{BLUE}{'═'*100}{RESET}\n")
+        
+        # Column headers
+        safe_print(f"{DIM}{'STATUS':7} {'URL':72} {'SIZE':>10} {'TIME':>8}{RESET}")
+        safe_print(f"{DIM}{'-'*100}{RESET}")
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as ex:
             futures = [ex.submit(self.worker, original_entries) for _ in range(self.threads)]
             try:
                 self.targets_queue.join()
             except KeyboardInterrupt:
-                safe_print("\n[!] Interrupted by user - stopping")
+                safe_print(f"\n{YELLOW}[!] Interrupted by user - stopping...{RESET}")
                 self.running = False
-            # cancel futures
+            
             for f in futures:
                 try:
                     f.cancel()
                 except Exception:
                     pass
 
+    def run_rich_mode(self, original_entries: List[str]):
+        """Advanced UI mode with rich library"""
+        console = Console()
+        
+        # Configuration panel
+        config_text = f"""[bold cyan]Target:[/bold cyan] {self.base}
+[bold cyan]Wordlist:[/bold cyan] {len(original_entries)} entries → {self.total_targets} targets
+[bold cyan]Threads:[/bold cyan] {self.threads}  [bold cyan]Timeout:[/bold cyan] {self.timeout}s
+[bold cyan]Filter:[/bold cyan] {"Status: " + ",".join(map(str, sorted(self.status_filter))) if self.status_filter else "All except 404"}"""
+        
+        console.print(Panel(config_text, title="[bold]Scan Configuration[/bold]", border_style="blue"))
+        
+        # Live results table
+        results_table = Table(show_header=True, header_style="bold cyan", box=box.ROUNDED)
+        results_table.add_column("Status", style="bold", width=8)
+        results_table.add_column("URL", style="", width=60)
+        results_table.add_column("Size", justify="right", width=10)
+        results_table.add_column("Time", justify="right", width=8)
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("({task.completed}/{task.total})"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False
+        ) as progress:
+            
+            scan_task = progress.add_task("[cyan]Scanning...", total=self.total_targets)
+            
+            def update_progress():
+                progress.update(scan_task, completed=self.processed_count)
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as ex:
+                futures = [ex.submit(self.worker, original_entries, update_progress) for _ in range(self.threads)]
+                try:
+                    self.targets_queue.join()
+                except KeyboardInterrupt:
+                    console.print("\n[yellow]⚠️  Interrupted by user - stopping...[/yellow]")
+                    self.running = False
+                
+                for f in futures:
+                    try:
+                        f.cancel()
+                    except Exception:
+                        pass
+        
+        # Show results in table
+        if self.discovered:
+            console.print("\n")
+            for code, url, size, elapsed in self.discovered:
+                style = "green bold" if 200 <= code < 300 else "cyan" if 300 <= code < 400 else "yellow bold" if code == 403 else "yellow" if 400 <= code < 500 else "red"
+                results_table.add_row(
+                    f"[{style}]{code}[/{style}]",
+                    url[:60] + "..." if len(url) > 60 else url,
+                    format_size(size),
+                    f"{elapsed:.2f}s"
+                )
+            
+            console.print(results_table)
+
+    def run(self, original_entries: List[str]):
+        if self.use_rich:
+            self.run_rich_mode(original_entries)
+        else:
+            self.run_clean_mode(original_entries)
+
+    def print_summary(self):
+        """Print detailed summary"""
+        elapsed_total = time.time() - self.start_time
+        
+        if self.use_rich and RICH_AVAILABLE:
+            console = Console()
+            
+            # Summary panel
+            summary_text = f"[bold]Total Findings:[/bold] {len(self.discovered)}\n"
+            summary_text += f"[bold]Scan Duration:[/bold] {elapsed_total:.2f}s\n"
+            summary_text += f"[bold]Requests/sec:[/bold] {self.processed_count/elapsed_total:.2f}\n\n"
+            
+            if self.stats_by_code:
+                summary_text += "[bold]Status Distribution:[/bold]\n"
+                for code in sorted(self.stats_by_code.keys()):
+                    style = "green" if 200 <= code < 300 else "cyan" if 300 <= code < 400 else "yellow" if 400 <= code < 500 else "red"
+                    summary_text += f"  [{style}][{code}][/{style}] - {self.stats_by_code[code]} responses\n"
+            
+            console.print(Panel(summary_text, title="[bold]Scan Summary[/bold]", border_style="green"))
+            
+            # Highlight 200 responses
+            success_responses = [(c, u, s, e) for c, u, s, e in self.discovered if c == 200]
+            if success_responses:
+                console.print("\n[bold green]  SUCCESS RESPONSES (200 OK):[/bold green]")
+                for code, url, size, elapsed in success_responses:
+                    console.print(f"  [green]✓[/green] {url} [{format_size(size)}] [{elapsed:.2f}s]")
+        else:
+            # Clean mode summary
+            safe_print(f"\n{BLUE}{'═'*100}{RESET}")
+            safe_print(f"{BRIGHT}{'SCAN SUMMARY':^100}{RESET}")
+            safe_print(f"{BLUE}{'═'*100}{RESET}")
+            safe_print(f"  {BRIGHT}Total Findings:{RESET}   {len(self.discovered)}")
+            safe_print(f"  {BRIGHT}Scan Duration:{RESET}    {elapsed_total:.2f}s")
+            safe_print(f"  {BRIGHT}Requests/sec:{RESET}     {self.processed_count/elapsed_total:.2f}")
+            
+            if self.stats_by_code:
+                safe_print(f"\n  {BRIGHT}Status Distribution:{RESET}")
+                for code in sorted(self.stats_by_code.keys()):
+                    color = self._get_status_color(code)
+                    safe_print(f"    {color}[{code}]{RESET} - {self.stats_by_code[code]} responses")
+            
+            # Highlight 200 responses
+            success_responses = [(c, u, s, e) for c, u, s, e in self.discovered if c == 200]
+            if success_responses:
+                safe_print(f"\n{GREEN}{BRIGHT}{'═'*100}{RESET}")
+                safe_print(f"{GREEN}{BRIGHT}  🎯 SUCCESS RESPONSES (200 OK): {len(success_responses)} found{RESET}")
+                safe_print(f"{GREEN}{BRIGHT}{'═'*100}{RESET}")
+                for code, url, size, elapsed in success_responses:
+                    safe_print(f"{GREEN}  ✓ {url:75} [{format_size(size):>8}] [{elapsed:.2f}s]{RESET}")
+            
+            # Other interesting responses
+            other_responses = [(c, u, s, e) for c, u, s, e in self.discovered if c != 200]
+            if other_responses:
+                safe_print(f"\n{BRIGHT}  OTHER FINDINGS:{RESET}")
+                for code, url, size, elapsed in other_responses:
+                    color = self._get_status_color(code)
+                    symbol = "↪" if 300 <= code < 400 else "⊗" if code == 403 else "!" if 400 <= code < 500 else "✗"
+                    safe_print(f"{color}  {symbol} [{code}] {url:70} [{format_size(size):>8}] [{elapsed:.2f}s]{RESET}")
+            
+            safe_print(f"{BLUE}{'═'*100}{RESET}\n")
+
 # ----- CLI parsing & main -----
 def parse_args():
-    p = argparse.ArgumentParser(prog=TOOL_NAME, description="VORTEXSCAN - dirsearch-like directory & file discovery (use only on permitted targets)")
-    p.add_argument("-u", "--url", required=True, help="Target URL or host (example.com or https://example.com)")
-    p.add_argument("-w", "--wordlist", required=True, help="Wordlist file (one entry per line)")
-    p.add_argument("-e", "--extensions", default="", help="Comma-separated extensions to append (e.g. php,html,txt)")
-    p.add_argument("-t", "--threads", type=int, default=40, help="Threads (default 40)")
-    p.add_argument("-T", "--timeout", type=float, default=10.0, help="Request timeout seconds (default 10)")
-    p.add_argument("-v", "--verbose", action="store_true", help="Verbose mode")
-    p.add_argument("--random-agent", action="store_true", help="Rotate random user-agent per request")
-    p.add_argument("-o", "--output", help="Output file to write findings")
-    p.add_argument("--format", choices=["text","json","csv"], default="text", help="Output format when using --output (default text)")
-    p.add_argument("--status", default="", help="Comma-separated status codes to show (e.g. 200,301,403). Default shows non-404.")
-    p.add_argument("--no-redirects", action="store_true", help="Do not follow redirects")
-    p.add_argument("--delay", type=float, default=0.0, help="Delay seconds between requests (per thread)")
-    p.add_argument("--proxy", help="Proxy URL (e.g. http://127.0.0.1:8080)")
-    p.add_argument("--auth", help="Basic auth user:pass")
-    p.add_argument("--recursive", action="store_true", help="Enable recursive scanning within discovered directories")
-    p.add_argument("--max-depth", type=int, default=2, help="Max recursion depth when using --recursive")
-    p.add_argument("--resume", action="store_true", help="Resume from output file (append and skip recorded URLs if file exists)")
+    p = argparse.ArgumentParser(
+        prog=TOOL_NAME,
+        description=f"{TOOL_NAME} v{VERSION} - Directory & File Discovery (use only on permitted targets)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Output Modes:
+  Clean Professional Mode (default) - Lightweight, color-coded, aligned output
+  Advanced UI Mode (auto-enabled)   - Rich tables & progress bars (requires 'rich' library)
+  
+Examples:
+  %(prog)s -u https://example.com -w wordlist.txt
+  %(prog)s -u example.com -w dirs.txt -e php,html,txt -t 50
+  %(prog)s -u https://example.com -w wordlist.txt -o results.txt --format json
+        """
+    )
+    p.add_argument("-u", "--url", required=True, help="Target URL or host")
+    p.add_argument("-w", "--wordlist", required=True, help="Wordlist file")
+    p.add_argument("-e", "--extensions", default="", help="Extensions (e.g. php,html,txt)")
+    p.add_argument("-t", "--threads", type=int, default=40, help="Threads (default: 40)")
+    p.add_argument("-T", "--timeout", type=float, default=10.0, help="Timeout in seconds (default: 10)")
+    p.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    p.add_argument("--random-agent", action="store_true", help="Rotate user agents")
+    p.add_argument("-o", "--output", help="Output file")
+    p.add_argument("--format", choices=["text","json","csv"], default="text", help="Output format (default: text)")
+    p.add_argument("--status", default="", help="Status codes filter (e.g. 200,301,403)")
+    p.add_argument("--no-redirects", action="store_true", help="Don't follow redirects")
+    p.add_argument("--delay", type=float, default=0.0, help="Delay between requests")
+    p.add_argument("--proxy", help="Proxy URL")
+    p.add_argument("--auth", help="Basic auth (user:pass)")
+    p.add_argument("--recursive", action="store_true", help="Recursive scanning")
+    p.add_argument("--max-depth", type=int, default=2, help="Max recursion depth (default: 2)")
+    p.add_argument("--resume", action="store_true", help="Resume from output file")
+    p.add_argument("--no-rich", action="store_true", help="Disable rich UI (use clean mode)")
     return p.parse_args()
 
 def main():
     args = parse_args()
-    print_banner()
+    
+    # Determine UI mode
+    use_rich = RICH_AVAILABLE and not args.no_rich
+    
+    if use_rich:
+        safe_print(f"{GREEN}[✓] Advanced UI Mode enabled (rich library detected){RESET}")
+    else:
+        if not RICH_AVAILABLE and not args.no_rich:
+            safe_print(f"{YELLOW}[i] Clean Professional Mode (install 'rich' for advanced UI: pip install rich){RESET}")
+    
+    print_banner(use_rich)
 
     base_raw = normalize_target(args.url)
-    # prepare headers for probe
     probe_headers = default_headers(args.random_agent)
     base = probe_scheme(base_raw, args.timeout, probe_headers, args.proxy)
-    if args.verbose:
-        safe_print(f"[+] Using base: {base}")
-
-    # load wordlist
+    
     try:
         entries = load_wordlist(args.wordlist)
     except Exception as e:
-        safe_print(f"{RED}[!] Failed to open wordlist: {e}{RESET}")
+        safe_print(f"{RED}[!] Failed to load wordlist: {e}{RESET}")
         sys.exit(1)
+    
     exts = [x.strip().lstrip(".") for x in args.extensions.split(",") if x.strip()] if args.extensions else []
     targets = expand_targets(entries, exts)
-    if args.verbose:
-        safe_print(f"[+] Wordlist entries: {len(entries)} -> build targets: {len(targets)}")
 
-    # parse status filter
     status_filter = None
     if args.status:
         try:
             status_filter = set(int(s) for s in args.status.split(",") if s.strip())
         except ValueError:
-            safe_print(f"{RED}[!] Invalid --status list (must be integers){RESET}")
+            safe_print(f"{RED}[!] Invalid --status format{RESET}")
             sys.exit(1)
 
     out_fp = None
     if args.output:
         mode = "a+" if args.resume else "w"
         try:
-            out_fp = open(args.output, mode, buffering=1)  # line buffered
+            out_fp = open(args.output, mode, buffering=1)
             if args.resume:
                 try:
                     out_fp.seek(0)
                 except Exception:
                     pass
         except Exception as e:
-            safe_print(f"{RED}[!] Unable to open output file: {e}{RESET}")
+            safe_print(f"{RED}[!] Cannot open output file: {e}{RESET}")
             sys.exit(1)
 
     auth = None
@@ -392,7 +623,6 @@ def main():
         user, pwd = args.auth.split(":", 1)
         auth = (user, pwd)
 
-    # Pre-populate scanner
     scanner = VortexScanner(
         base=base,
         targets=targets,
@@ -409,20 +639,21 @@ def main():
         recursive=args.recursive,
         max_depth=args.max_depth,
         resume=args.resume,
-        output_format=args.format
+        output_format=args.format,
+        use_rich=use_rich
     )
 
-    # Feed original entries to scanner.run for recursion use
     scanner.run(original_entries=entries)
 
-    # After run, optionally output structured formats if requested and file provided
+    # Print summary
+    scanner.print_summary()
+
+    # Export to structured formats if requested
     if args.output and args.format in ("json", "csv"):
         try:
-            # read the text lines and convert - easier than storing structured earlier
             out_fp.flush()
             out_fp.seek(0)
             lines = [ln.strip() for ln in out_fp if ln.strip()]
-            # parse lines like: 200 https://example.com/foo (123 bytes, 0.12s)
             parsed = []
             for ln in lines:
                 parts = ln.split()
@@ -432,13 +663,11 @@ def main():
                     except Exception:
                         continue
                     url = parts[1]
-                    # try to find size in parentheses
                     size = None
                     elapsed = None
                     if "(" in ln and "bytes" in ln:
                         try:
                             inside = ln.split("(",1)[1].split(")")[0]
-                            # "123 bytes, 0.12s"
                             if "bytes" in inside:
                                 s = inside.split("bytes")[0].strip().strip(",")
                                 size = int(s)
@@ -447,12 +676,13 @@ def main():
                         except Exception:
                             pass
                     parsed.append({"status": code, "url": url, "size": size, "time": elapsed})
+            
             if args.format == "json":
-                # overwrite output file with json
                 out_fp.seek(0)
                 out_fp.truncate(0)
                 out_fp.write(json.dumps(parsed, indent=2))
                 out_fp.flush()
+                safe_print(f"{GREEN}[✓] Results exported to {args.output} (JSON format){RESET}")
             elif args.format == "csv":
                 import csv
                 out_fp.seek(0)
@@ -462,16 +692,9 @@ def main():
                 for row in parsed:
                     writer.writerow(row)
                 out_fp.flush()
-        except Exception:
-            # ignore formatting errors
-            pass
-
-    # Show summary on console
-    safe_print("\n[+] Scan finished.")
-    if scanner.discovered:
-        safe_print(f"[+] Found {len(scanner.discovered)} results.")
-    else:
-        safe_print("[+] No interesting results (based on filters).")
+                safe_print(f"{GREEN}[✓] Results exported to {args.output} (CSV format){RESET}")
+        except Exception as e:
+            safe_print(f"{YELLOW}[!] Export warning: {e}{RESET}")
 
     if out_fp:
         out_fp.close()
